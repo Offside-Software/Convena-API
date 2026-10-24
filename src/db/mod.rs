@@ -6,8 +6,7 @@ use std::time::Duration;
 pub fn get_connect_options(database_url: &str) -> Result<PgConnectOptions, sqlx::Error> {
     let options = PgConnectOptions::from_str(database_url)?
         .statement_cache_capacity(0); // Essential for Supabase / PgBouncer / Supavisor pooler
-    Ok
-    (options)
+    Ok(options)
 }
 
 /// Help to construct queries with `.persistent(false)` for PgBouncer / Supavisor Compatibility.
@@ -38,7 +37,7 @@ where
 
 pub fn get_pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
-        // Supabase Session Pooler has a globa per-project session limit (15 by default)
+        // Supabase Session Pooler has a global per-project session limit (15 by default)
         // Keep our API pool conservative so it never hits EMAXCONNSESSION.
         .max_connections(3)
         .min_connections(0)
@@ -60,7 +59,26 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
 
 pub async fn init_database(pool: &PgPool) -> Result<(), sqlx::Error> {
     // Ensure Convena Schema
-    let _ = sqlx::raw_sql("CREATE SCHEMA IF NOT EXISTS convena;")
+    let init_sql = r#"
+        CREATE SCHEMA IF NOT EXISTS convena;
+
+        CREATE TABLE IF NOT EXISTS convena.users (
+            id UUID PRIMARY KEY,
+            display_name VARCHAR(255) NOT NULL,
+            username VARCHAR(100) UNIQUE NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            role VARCHAR(50) NOT NULL DEFAULT 'attendee',
+            company VARCHAR(255)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_users_username ON convena.users (username);
+        CREATE INDEX IF NOT EXISTS idx_users_email ON convena.users (email);
+    "#;
+
+    sqlx::raw_sql(init_sql)
         .execute(pool)
         .await?;
 

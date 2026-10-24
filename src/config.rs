@@ -9,6 +9,7 @@ pub struct Config {
     pub database_url: String,
     pub supabase_url: String,
     pub supabase_key: String,
+    pub jwt_secret: String,
 }
 
 fn clean_val(v: String) -> String {
@@ -52,11 +53,13 @@ impl Config {
 
         let database_url = Self::resolve_database_url();
         let port = get_clean_env("PORT").and_then(|p| p.parse().ok()).unwrap_or(8000);
+        let jwt_secret = get_clean_env("JWT_SECRET").unwrap_or_else(|| "default_secret_jwt_key_convena_2026".to_string());
         Self {
             port,
             database_url,
             supabase_url: get_clean_env("SUPABASE_URL").unwrap_or_default(),
-            supabase_key: get_clean_env("SUPABASE_KEY").unwrap_or_default()
+            supabase_key: get_clean_env("SUPABASE_KEY").unwrap_or_default(),
+            jwt_secret,
         }
     }
 

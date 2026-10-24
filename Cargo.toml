@@ -28,3 +28,5 @@ async-trait = "0.1.92"
 web-push-native = "0.5.0"
 base64ct = { version = "1.8", features = ["alloc"] }
 argon2 = "0.6.0"
+uuid = { version = "1", features = ["v4", "serde"] }
+
