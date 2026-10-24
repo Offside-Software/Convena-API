@@ -32,7 +32,7 @@ pub async fn register_handler(
         .display_name
         .or(payload.name)
         .unwrap_or_else(|| username.clone());
-    let role = payload.role.unwrap_or_else(|| "attendee".to_string());
+    let role = payload.role.unwrap_or_else(|| "user".to_string());
     let company = payload.company.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
 
     if username.is_empty() || email.is_empty() || payload.password.trim().is_empty() {

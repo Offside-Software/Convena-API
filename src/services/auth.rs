@@ -60,6 +60,24 @@ pub fn verify_jwt(token: &str, secret: &str) -> anyhow::Result<Claims> {
     Ok(token_data.claims)
 }
 
+pub fn extract_user_id_from_headers(
+    headers: &axum::http::HeaderMap,
+    secret: &str,
+) -> Result<uuid::Uuid, &'static str> {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or("MISSING_AUTH_HEADER")?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .ok_or("INVALID_TOKEN_FORMAT")?;
+
+    let claims = verify_jwt(token, secret).map_err(|_| "INVALID_TOKEN")?;
+    uuid::Uuid::parse_str(&claims.sub).map_err(|_| "INVALID_USER_ID")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

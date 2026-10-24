@@ -70,12 +70,72 @@ pub async fn init_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             password_hash TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            role VARCHAR(50) NOT NULL DEFAULT 'attendee',
+            role VARCHAR(50) NOT NULL DEFAULT 'user',
             company VARCHAR(255)
         );
 
         CREATE INDEX IF NOT EXISTS idx_users_username ON convena.users (username);
         CREATE INDEX IF NOT EXISTS idx_users_email ON convena.users (email);
+
+        CREATE TABLE IF NOT EXISTS convena.events (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            created_by UUID NOT NULL REFERENCES convena.users(id) ON DELETE CASCADE,
+            title VARCHAR(255) NOT NULL,
+            slug VARCHAR(255) UNIQUE NOT NULL,
+            description TEXT,
+            short_description VARCHAR(500),
+            banner_url TEXT,
+            category VARCHAR(50) NOT NULL,
+            status VARCHAR(50) NOT NULL DEFAULT 'draft',
+            visibility VARCHAR(50) NOT NULL DEFAULT 'public',
+            start_date TIMESTAMPTZ NOT NULL,
+            end_date TIMESTAMPTZ NOT NULL,
+            location_type VARCHAR(50) NOT NULL DEFAULT 'offline',
+            venue_name VARCHAR(255),
+            address TEXT,
+            city VARCHAR(100),
+            online_url TEXT,
+            organization_name VARCHAR(255),
+            university VARCHAR(255),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_slug ON convena.events (slug);
+        CREATE INDEX IF NOT EXISTS idx_events_created_by ON convena.events (created_by);
+        CREATE INDEX IF NOT EXISTS idx_events_status ON convena.events (status);
+
+        CREATE TABLE IF NOT EXISTS convena.event_members (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_id UUID NOT NULL REFERENCES convena.events(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES convena.users(id) ON DELETE CASCADE,
+            role VARCHAR(50) NOT NULL,
+            custom_title VARCHAR(100),
+            status VARCHAR(50) NOT NULL DEFAULT 'active',
+            joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (event_id, user_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_members_user ON convena.event_members (user_id);
+        CREATE INDEX IF NOT EXISTS idx_event_members_event ON convena.event_members (event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_members_role ON convena.event_members (role);
+
+        CREATE TABLE IF NOT EXISTS convena.event_invitations (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_id UUID NOT NULL REFERENCES convena.events(id) ON DELETE CASCADE,
+            invited_by UUID NOT NULL REFERENCES convena.users(id) ON DELETE CASCADE,
+            email VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL DEFAULT 'committee',
+            custom_title VARCHAR(100),
+            token VARCHAR(255) UNIQUE NOT NULL,
+            status VARCHAR(50) NOT NULL DEFAULT 'pending',
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_invitations_token ON convena.event_invitations (token);
+        CREATE INDEX IF NOT EXISTS idx_event_invitations_email ON convena.event_invitations (email);
     "#;
 
     sqlx::raw_sql(init_sql)
