@@ -47,6 +47,22 @@ fn generate_slug(title: &str) -> String {
     format!("{trimmed}-{suffix}")
 }
 
+fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
+                .or_else(|_| {
+                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                })
+                .map(|naive| naive.and_utc())
+                .ok()
+        })
+}
+
 /// Create a new event and automatically make the creator the 'owner'.
 pub async fn create_event_handler(
     State(state): State<AppState>,
@@ -70,6 +86,26 @@ pub async fn create_event_handler(
             Json(json!({ "message": "Judul event wajib diisi", "code": "MISSING_TITLE" })),
         );
     }
+
+    let start_date = match parse_datetime(&payload.start_date) {
+        Some(dt) => dt,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "message": "Format tanggal mulai tidak valid", "code": "INVALID_START_DATE" })),
+            );
+        }
+    };
+
+    let end_date = match parse_datetime(&payload.end_date) {
+        Some(dt) => dt,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "message": "Format tanggal selesai tidak valid", "code": "INVALID_END_DATE" })),
+            );
+        }
+    };
 
     let slug = payload
         .slug
@@ -116,8 +152,8 @@ pub async fn create_event_handler(
         .bind(payload.short_description)
         .bind(payload.banner_url)
         .bind(payload.category)
-        .bind(payload.start_date)
-        .bind(payload.end_date)
+        .bind(start_date)
+        .bind(end_date)
         .bind(location_type)
         .bind(payload.venue_name)
         .bind(payload.address)
