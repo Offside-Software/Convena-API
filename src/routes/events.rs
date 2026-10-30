@@ -114,7 +114,10 @@ pub async fn create_event_handler(
 
     let event_id = Uuid::new_v4();
     let now = chrono::Utc::now();
+    let status = payload.status.unwrap_or_else(|| "draft".to_string());
+    let visibility = payload.visibility.unwrap_or_else(|| "public".to_string());
     let location_type = payload.location_type.unwrap_or_else(|| "offline".to_string());
+    let ticket_tiers = sqlx::types::Json(payload.ticket_tiers.unwrap_or_default());
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -132,14 +135,15 @@ pub async fn create_event_handler(
         INSERT INTO convena.events (
             id, created_by, title, slug, description, short_description, banner_url,
             category, status, visibility, start_date, end_date, location_type,
-            venue_name, address, city, online_url, organization_name, university,
+            venue_name, address, city, online_url, organization_name, company, ticket_tiers,
             created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, 'draft', 'public', $9, $10, $11,
-            $12, $13, $14, $15, $16, $17, $18, $18
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+            $14, $15, $16, $17, $18, $19, $20,
+            $21, $21
         ) RETURNING id, created_by, title, slug, description, short_description, banner_url,
                     category, status, visibility, start_date, end_date, location_type,
-                    venue_name, address, city, online_url, organization_name, university,
+                    venue_name, address, city, online_url, organization_name, company, ticket_tiers,
                     created_at, updated_at
     "#;
 
@@ -152,6 +156,8 @@ pub async fn create_event_handler(
         .bind(payload.short_description)
         .bind(payload.banner_url)
         .bind(payload.category)
+        .bind(status)
+        .bind(visibility)
         .bind(start_date)
         .bind(end_date)
         .bind(location_type)
@@ -160,7 +166,8 @@ pub async fn create_event_handler(
         .bind(payload.city)
         .bind(payload.online_url)
         .bind(payload.organization_name)
-        .bind(payload.university)
+        .bind(payload.company)
+        .bind(ticket_tiers)
         .bind(now)
         .fetch_one(&mut *tx)
         .await
@@ -238,7 +245,8 @@ pub async fn list_my_events_handler(
         SELECT 
             e.id, e.created_by, e.title, e.slug, e.description, e.short_description, e.banner_url,
             e.category, e.status, e.visibility, e.start_date, e.end_date, e.location_type,
-            e.venue_name, e.organization_name, e.university, e.created_at,
+            e.venue_name, e.address, e.city, e.online_url, e.organization_name, e.company,
+            e.ticket_tiers, e.created_at, e.updated_at,
             m.role as my_role, m.custom_title as my_custom_title
         FROM convena.events e
         INNER JOIN convena.event_members m ON e.id = m.event_id
@@ -268,8 +276,8 @@ pub async fn list_events_handler(State(state): State<AppState>) -> impl IntoResp
         SELECT 
             id, created_by, title, slug, description, short_description, banner_url,
             category, status, visibility, start_date, end_date, location_type,
-            venue_name, address, city, online_url, organization_name, university,
-            created_at, updated_at
+            venue_name, address, city, online_url, organization_name, company,
+            ticket_tiers, created_at, updated_at
         FROM convena.events
         WHERE visibility = 'public'
         ORDER BY start_date ASC
@@ -300,8 +308,8 @@ pub async fn get_event_handler(
         SELECT 
             id, created_by, title, slug, description, short_description, banner_url,
             category, status, visibility, start_date, end_date, location_type,
-            venue_name, address, city, online_url, organization_name, university,
-            created_at, updated_at
+            venue_name, address, city, online_url, organization_name, company,
+            ticket_tiers, created_at, updated_at
         FROM convena.events
         WHERE id = $1
     "#;

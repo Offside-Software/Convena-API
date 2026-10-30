@@ -96,10 +96,28 @@ pub async fn init_database(pool: &PgPool) -> Result<(), sqlx::Error> {
             city VARCHAR(100),
             online_url TEXT,
             organization_name VARCHAR(255),
-            university VARCHAR(255),
+            company VARCHAR(255),
+            ticket_tiers JSONB NOT NULL DEFAULT '[]'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_schema = 'convena' AND table_name = 'events' AND column_name = 'university'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_schema = 'convena' AND table_name = 'events' AND column_name = 'company'
+            ) THEN
+                ALTER TABLE convena.events RENAME COLUMN university TO company;
+            ELSE
+                ALTER TABLE convena.events ADD COLUMN IF NOT EXISTS company VARCHAR(255);
+            END IF;
+
+            ALTER TABLE convena.events ADD COLUMN IF NOT EXISTS ticket_tiers JSONB NOT NULL DEFAULT '[]'::jsonb;
+        END $$;
 
         CREATE INDEX IF NOT EXISTS idx_events_slug ON convena.events (slug);
         CREATE INDEX IF NOT EXISTS idx_events_created_by ON convena.events (created_by);
