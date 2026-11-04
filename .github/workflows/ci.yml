@@ -61,7 +61,7 @@ jobs:
           host: ${{ secrets.DEWACLOUD_SSH_HOST || vars.DEWACLOUD_SSH_HOST }}
           port: ${{ secrets.DEWACLOUD_SSH_PORT || vars.DEWACLOUD_SSH_PORT }}
           username: ${{ secrets.DEWACLOUD_SSH_USER || vars.DEWACLOUD_SSH_USER }}
-          key: ${{ secrets.DEWACLOUD_PRIVATE_KEY || vars.DEWACLOUD_PRIVATE_KEY }}
+          key: ${{ secrets.DEWACLOUD_SSH_PRIVATE_KEY || vars.DEWACLOUD_SSH_PRIVATE_KEY }}
           script: |
             set -e
             echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
