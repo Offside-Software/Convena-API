@@ -1,0 +1,10 @@
+target/
+cache/
+.git/
+.gitignore
+.github/
+.env*
+dockerfile
+Dockerfile
+README.md
+ARCHITECTURE.md
