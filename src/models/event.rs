@@ -218,4 +218,17 @@ pub struct RegisterEventPayload {
 pub struct AttendEventQrPayload {
     pub qr_code: String,
     pub event_id: Option<Uuid>,
+    pub registration_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttendanceRealtimeEvent {
+    pub event_type: String,
+    pub event_id: Uuid,
+    pub event_title: String,
+    pub already_checked_in: bool,
+    pub message: String,
+    pub registration: EventRegistration,
+    pub timestamp: DateTime<Utc>,
 }

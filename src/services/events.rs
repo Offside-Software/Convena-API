@@ -1,10 +1,16 @@
+use std::{convert::Infallible, time::Duration};
+
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, patch, post},
     Json, Router,
 };
+use futures_util::stream::{self, Stream};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -13,9 +19,9 @@ use crate::{
     db,
     models::{
         event::{
-            AttendEventQrPayload, CreateEventPayload, CreateEventTaskPayload, Event,
-            EventRegistration, EventTask, EventWithRole, RegisterEventPayload, TicketTier,
-            UpdateEventPayload, UpdateEventTaskPayload,
+            AttendEventQrPayload, AttendanceRealtimeEvent, CreateEventPayload,
+            CreateEventTaskPayload, Event, EventRegistration, EventTask, EventWithRole,
+            RegisterEventPayload, TicketTier, UpdateEventPayload, UpdateEventTaskPayload,
         },
         finance::DEFAULT_BUDGET_CATEGORIES,
         membership::{
@@ -55,7 +61,12 @@ pub fn event_routes() -> Router<AppState> {
         .route("/{id}/register", post(register_event_handler))
         .route("/{id}/my-registration", get(get_my_event_registration_handler))
         .route("/{id}/registrations", get(list_event_registrations_handler))
+        .route(
+            "/{id}/registrations/{reg_id}/check-in",
+            post(check_in_registration_handler),
+        )
         .route("/{id}/attendance-qr", post(generate_attendance_qr_handler))
+        .route("/{id}/attendance-stream", get(attendance_stream_handler))
 }
 
 fn generate_slug(title: &str) -> String {
@@ -1458,7 +1469,7 @@ pub async fn register_event_handler(
     .fetch_optional(&state.pool)
     .await;
 
-    let (_event_title, mut tiers_json) = match event_row {
+    let (event_title, mut tiers_json) = match event_row {
         Ok(Some(row)) => row,
         Ok(None) => {
             return (
@@ -1592,6 +1603,19 @@ pub async fn register_event_handler(
         .bind(event_id)
         .execute(&state.pool)
         .await;
+
+    let _ = state.attendance_tx.send(AttendanceRealtimeEvent {
+        event_type: "registration.created".to_string(),
+        event_id,
+        event_title: event_title.clone(),
+        already_checked_in: false,
+        message: format!(
+            "Peserta baru terdaftar: {} ({})",
+            registration.attendee_name, registration.tier_name
+        ),
+        registration: registration.clone(),
+        timestamp: chrono::Utc::now(),
+    });
 
     (
         StatusCode::CREATED,
@@ -1984,6 +2008,20 @@ pub async fn attend_event_by_qr_handler(
     }
 
     if registration.status == "checked_in" {
+        let msg = format!(
+            "Peserta {} ({}) memindai QR Presensi (Sudah tercatat hadir sebelumnya).",
+            registration.attendee_name, registration.ticket_code
+        );
+        let _ = state.attendance_tx.send(AttendanceRealtimeEvent {
+            event_type: "attendance.checked_in".to_string(),
+            event_id,
+            event_title: event_title.clone(),
+            already_checked_in: true,
+            message: msg,
+            registration: registration.clone(),
+            timestamp: chrono::Utc::now(),
+        });
+
         return (
             StatusCode::OK,
             Json(json!({
@@ -2010,15 +2048,30 @@ pub async fn attend_event_by_qr_handler(
         .fetch_one(&state.pool)
         .await
     {
-        Ok(updated_reg) => (
-            StatusCode::OK,
-            Json(json!({
-                "message": format!("Presensi berhasil! Selamat datang di \"{}\".", event_title),
-                "alreadyCheckedIn": false,
-                "eventTitle": event_title,
-                "registration": updated_reg
-            })),
-        ),
+        Ok(updated_reg) => {
+            let _ = state.attendance_tx.send(AttendanceRealtimeEvent {
+                event_type: "attendance.checked_in".to_string(),
+                event_id,
+                event_title: event_title.clone(),
+                already_checked_in: false,
+                message: format!(
+                    "{} ({}) berhasil melakukan presensi kehadiran!",
+                    updated_reg.attendee_name, updated_reg.ticket_code
+                ),
+                registration: updated_reg.clone(),
+                timestamp: chrono::Utc::now(),
+            });
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "message": format!("Presensi berhasil! Selamat datang di \"{}\".", event_title),
+                    "alreadyCheckedIn": false,
+                    "eventTitle": event_title,
+                    "registration": updated_reg
+                })),
+            )
+        }
         Err(e) => {
             tracing::error!("Failed to mark registration checked_in: {e}");
             (
@@ -2027,4 +2080,143 @@ pub async fn attend_event_by_qr_handler(
             )
         }
     }
+}
+
+/// Allow event organizers / committee members to directly check in a registered & paid attendee
+/// (or trigger the real-time attendance event from the organizer console).
+pub async fn check_in_registration_handler(
+    State(state): State<AppState>,
+    Path((event_id, reg_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let current_user_id = match extract_user_id_from_headers(&headers, &state.config.jwt_secret) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "message": "Otorisasi diperlukan", "code": "UNAUTHORIZED" })),
+            );
+        }
+    };
+
+    let can_checkin = check_event_permission(
+        &state.pool,
+        current_user_id,
+        event_id,
+        EventPermission::TicketsScanCheckin,
+    )
+    .await
+    .unwrap_or(false)
+        || check_event_permission(
+            &state.pool,
+            current_user_id,
+            event_id,
+            EventPermission::TeamViewMembers,
+        )
+        .await
+        .unwrap_or(false);
+
+    if !can_checkin {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "message": "Hanya penyelenggara/panitia yang dapat memverifikasi kehadiran peserta",
+                "code": "FORBIDDEN"
+            })),
+        );
+    }
+
+    let event_title = db::query_scalar::<sqlx::Postgres, String>(
+        "SELECT title FROM convena.events WHERE id = $1",
+    )
+    .bind(event_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "Event Convena".to_string());
+
+    let update_reg_sql = r#"
+        UPDATE convena.event_registrations
+        SET status = 'checked_in', checked_in_at = COALESCE(checked_in_at, NOW())
+        WHERE id = $1 AND event_id = $2
+        RETURNING id, event_id, user_id, tier_id, tier_name, price, payment_method, payment_status,
+                  status, attendee_name, attendee_email, attendee_phone, attendee_institution,
+                  ticket_code, checked_in_at, created_at
+    "#;
+
+    match db::query_as::<sqlx::Postgres, EventRegistration>(update_reg_sql)
+        .bind(reg_id)
+        .bind(event_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(updated_reg)) => {
+            let _ = state.attendance_tx.send(AttendanceRealtimeEvent {
+                event_type: "attendance.checked_in".to_string(),
+                event_id,
+                event_title: event_title.clone(),
+                already_checked_in: false,
+                message: format!(
+                    "{} ({}) berhasil melakukan presensi kehadiran!",
+                    updated_reg.attendee_name, updated_reg.ticket_code
+                ),
+                registration: updated_reg.clone(),
+                timestamp: chrono::Utc::now(),
+            });
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "message": format!("Peserta {} berhasil ditandai HADIR.", updated_reg.attendee_name),
+                    "alreadyCheckedIn": false,
+                    "eventTitle": event_title,
+                    "registration": updated_reg
+                })),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "message": "Data pendaftaran peserta tidak ditemukan", "code": "NOT_FOUND" })),
+        ),
+        Err(e) => {
+            tracing::error!("Failed to check in registration: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": "Gagal memperbarui status kehadiran peserta", "code": "DB_ERROR" })),
+            )
+        }
+    }
+}
+
+/// Real-time Server-Sent Events (SSE) stream for live attendance & registration updates on an event.
+pub async fn attendance_stream_handler(
+    State(state): State<AppState>,
+    Path(event_id): Path<Uuid>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let rx = state.attendance_tx.subscribe();
+    let event_stream = stream::unfold(rx, move |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(evt) => {
+                    if evt.event_id == event_id {
+                        if let Ok(json_str) = serde_json::to_string(&evt) {
+                            let sse_evt = SseEvent::default()
+                                .event(evt.event_type.clone())
+                                .data(json_str);
+                            return Some((Ok(sse_evt), rx));
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Sse::new(event_stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }

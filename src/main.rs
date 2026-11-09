@@ -46,9 +46,12 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods(tower_http::cors::AllowMethods::mirror_request())
         .allow_headers(tower_http::cors::AllowHeaders::mirror_request());
 
+    let (attendance_tx, _) = tokio::sync::broadcast::channel(256);
+
     let app_state = AppState {
         pool: pool.clone(),
         config: config.clone(),
+        attendance_tx,
     };
 
     let trace_layer = tower_http::trace::TraceLayer::new_for_http()
