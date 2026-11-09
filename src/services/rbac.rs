@@ -32,9 +32,96 @@ pub async fn check_event_permission(
     event_id: Uuid,
     permission: EventPermission,
 ) -> Result<bool, sqlx::Error> {
+    // 1. Direct event committee membership check
     let role = get_user_event_role(pool, user_id, event_id).await?;
-    match role {
-        Some(r) => Ok(r.has_permission(permission)),
+    if let Some(r) = role {
+        if r.has_permission(permission) {
+            return Ok(true);
+        }
+    }
+
+    // 2. Organization inheritance: if the event belongs to an organization,
+    // organization owner/admin or members with corresponding org permission also have access.
+    let org_query = r#"
+        SELECT organization_id
+        FROM convena.events
+        WHERE id = $1
+    "#;
+    let org_row = db::query_as::<sqlx::Postgres, (Option<Uuid>,)>(org_query)
+        .bind(event_id)
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some((Some(org_id),)) = org_row {
+        let (role_name, _, perms) = match get_user_org_role_and_permissions(pool, user_id, org_id).await? {
+            Some(res) => res,
+            None => return Ok(false),
+        };
+
+        if role_name == "owner" {
+            return Ok(true);
+        }
+
+        // Map EventPermission to permission string key
+        let perm_key = match permission {
+            EventPermission::EventEditSettings => "event:edit",
+            EventPermission::EventDelete => "event:delete",
+            EventPermission::TeamInviteMember | EventPermission::TeamManageRoles | EventPermission::TeamViewMembers => "event:manage_team",
+            EventPermission::TicketsManageTiers | EventPermission::TicketsScanCheckin => "event:edit",
+            EventPermission::FinanceViewBudget => "finance:view",
+            EventPermission::FinanceSubmitSpj => "finance:submit_expense",
+            EventPermission::FinanceAuditSpj => "finance:audit_spj",
+            EventPermission::SponsorshipManage | EventPermission::SponsorshipDeliverables => "sponsor:manage",
+            EventPermission::CertificateIssue => "cert:issue",
+            EventPermission::AttendeeViewOwnTicket => return Ok(true),
+        };
+
+        if perms.contains(&perm_key.to_string()) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Fetch the role name, display name, and active permissions array for a user in an organization.
+pub async fn get_user_org_role_and_permissions(
+    pool: &PgPool,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> Result<Option<(String, String, Vec<String>)>, sqlx::Error> {
+    let sql = r#"
+        SELECT r.name, r.display_name, r.permissions
+        FROM convena.organization_members m
+        INNER JOIN convena.organization_roles r ON m.role_id = r.id
+        WHERE m.organization_id = $1 AND m.user_id = $2 AND m.status = 'active'
+    "#;
+
+    let row = db::query_as::<sqlx::Postgres, (String, String, sqlx::types::Json<Vec<String>>)>(sql)
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.map(|(name, display_name, perms)| (name, display_name, perms.0)))
+}
+
+/// Check if a user has a specific permission in an organization.
+/// The 'owner' role always has all permissions.
+pub async fn check_org_permission(
+    pool: &PgPool,
+    user_id: Uuid,
+    org_id: Uuid,
+    permission: &str,
+) -> Result<bool, sqlx::Error> {
+    let user_role_perms = get_user_org_role_and_permissions(pool, user_id, org_id).await?;
+    match user_role_perms {
+        Some((role_name, _, perms)) => {
+            if role_name == "owner" {
+                return Ok(true);
+            }
+            Ok(perms.iter().any(|p| p == permission))
+        }
         None => Ok(false),
     }
 }
@@ -86,5 +173,31 @@ mod tests {
         assert_eq!(EventRole::from_str("sponsor"), Some(EventRole::Sponsor));
         assert_eq!(EventRole::from_str("attendee"), Some(EventRole::Attendee));
         assert_eq!(EventRole::from_str("invalid_role"), None);
+    }
+
+    #[test]
+    fn test_default_system_roles_integrity() {
+        use crate::models::organization::{DEFAULT_SYSTEM_ROLES, PERMISSIONS_CATALOG};
+
+        let valid_perm_keys: std::collections::HashSet<&str> =
+            PERMISSIONS_CATALOG.iter().map(|(k, _, _, _)| *k).collect();
+
+        for (name, _, _, perms) in DEFAULT_SYSTEM_ROLES {
+            assert!(!name.is_empty());
+            for perm in *perms {
+                assert!(
+                    valid_perm_keys.contains(perm),
+                    "Permission {perm} in role {name} does not exist in PERMISSIONS_CATALOG"
+                );
+            }
+        }
+
+        // Owner must have all permissions
+        let owner_perms = DEFAULT_SYSTEM_ROLES
+            .iter()
+            .find(|(n, _, _, _)| *n == "owner")
+            .unwrap()
+            .3;
+        assert_eq!(owner_perms.len(), PERMISSIONS_CATALOG.len());
     }
 }

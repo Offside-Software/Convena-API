@@ -6,8 +6,8 @@ use crate::appstate::AppState;
 pub mod auth;
 pub mod events;
 pub mod finance;
+pub mod organizations;
 pub mod rbac;
-pub mod realtime;
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -18,6 +18,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/events", events::event_routes())
         .nest("/api/finances", finance::finance_routes())
         .nest("/finances", finance::finance_routes())
+        .nest("/api/organizations", organizations::organization_routes())
+        .nest("/organizations", organizations::organization_routes())
         .with_state(state)
 }
 

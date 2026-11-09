@@ -99,6 +99,7 @@ pub struct EventMember {
     pub user_id: Uuid,
     pub role: String,
     pub custom_title: Option<String>,
+    pub division: String,
     pub status: String,
     pub joined_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -115,6 +116,7 @@ pub struct EventMemberDetail {
     pub email: String,
     pub role: String,
     pub custom_title: Option<String>,
+    pub division: String,
     pub status: String,
     pub joined_at: DateTime<Utc>,
 }
@@ -128,6 +130,7 @@ pub struct EventInvitation {
     pub email: String,
     pub role: String,
     pub custom_title: Option<String>,
+    pub division: String,
     pub token: String,
     pub status: String,
     pub expires_at: DateTime<Utc>,
@@ -140,6 +143,7 @@ pub struct InviteMemberPayload {
     pub email: String,
     pub role: String,
     pub custom_title: Option<String>,
+    pub division: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,4 +151,5 @@ pub struct InviteMemberPayload {
 pub struct UpdateMemberRolePayload {
     pub role: String,
     pub custom_title: Option<String>,
+    pub division: Option<String>,
 }

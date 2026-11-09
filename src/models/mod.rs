@@ -1,4 +1,5 @@
 pub mod event;
-pub mod membership;
-pub mod user;
 pub mod finance;
+pub mod membership;
+pub mod organization;
+pub mod user;
