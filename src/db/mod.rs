@@ -2,6 +2,10 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::time::Duration;
+use uuid::Uuid;
+
+use crate::models::finance::DEFAULT_BUDGET_CATEGORIES;
+use crate::services::auth::hash_password;
 
 pub fn get_connect_options(database_url: &str) -> Result<PgConnectOptions, sqlx::Error> {
     let options = PgConnectOptions::from_str(database_url)?
@@ -11,13 +15,16 @@ pub fn get_connect_options(database_url: &str) -> Result<PgConnectOptions, sqlx:
 
 /// Help to construct queries with `.persistent(false)` for PgBouncer / Supavisor Compatibility.
 /// Prevents named prepared statement collisions (`sqlx_s... alread exists`) in transaction pooling mode.
-pub fn query<'q>(sql: &'q str) -> sqlx::query::Query<'q, sqlx::Postgres, <sqlx::Postgres as sqlx::Database>::Arguments<'q>> {
+pub fn query<'q>(
+    sql: &'q str,
+) -> sqlx::query::Query<'q, sqlx::Postgres, <sqlx::Postgres as sqlx::Database>::Arguments<'q>> {
     sqlx::query(sql).persistent(false)
 }
 
-/// Helper to consturct query_as with `.persistent(false)` for PgBouncer / Supavisor compatibility.
-pub fn query_as<'q, DB, O>(sql: &'q str) 
--> sqlx::query::QueryAs<'q, DB, O, <DB as sqlx::Database>::Arguments<'q>>
+/// Helper to construct query_as with `.persistent(false)` for PgBouncer / Supavisor compatibility.
+pub fn query_as<'q, DB, O>(
+    sql: &'q str,
+) -> sqlx::query::QueryAs<'q, DB, O, <DB as sqlx::Database>::Arguments<'q>>
 where
     DB: sqlx::Database + sqlx::database::HasStatementCache,
     O: for<'r> sqlx::FromRow<'r, DB::Row>,
@@ -25,10 +32,11 @@ where
     sqlx::query_as(sql).persistent(false)
 }
 
-/// Helper to consturct query_scalar with `.persistent(false)` for PgBouncer / Supavisor compatibility.
-pub fn query_scalar<'q, DB, O>(sql: &'q str) 
--> sqlx::query::QueryScalar<'q, DB, O, <DB as sqlx::Database>::Arguments<'q>>
-where 
+/// Helper to construct query_scalar with `.persistent(false)` for PgBouncer / Supavisor compatibility.
+pub fn query_scalar<'q, DB, O>(
+    sql: &'q str,
+) -> sqlx::query::QueryScalar<'q, DB, O, <DB as sqlx::Database>::Arguments<'q>>
+where
     DB: sqlx::Database + sqlx::database::HasStatementCache,
     (O,): for<'r> sqlx::FromRow<'r, DB::Row>,
 {
@@ -49,16 +57,14 @@ pub fn get_pool_options() -> PgPoolOptions {
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let options = get_connect_options(database_url)?;
 
-    let pool = get_pool_options()
-        .connect_with(options)
-        .await?;
+    let pool = get_pool_options().connect_with(options).await?;
 
     init_database(&pool).await?;
     Ok(pool)
 }
 
 pub async fn init_database(pool: &PgPool) -> Result<(), sqlx::Error> {
-    // Ensure Convena Schema
+    // Ensure Convena Schema & Tables
     let init_sql = r#"
         CREATE SCHEMA IF NOT EXISTS convena;
 
@@ -154,12 +160,547 @@ pub async fn init_database(pool: &PgPool) -> Result<(), sqlx::Error> {
 
         CREATE INDEX IF NOT EXISTS idx_event_invitations_token ON convena.event_invitations (token);
         CREATE INDEX IF NOT EXISTS idx_event_invitations_email ON convena.event_invitations (email);
+
+        CREATE TABLE IF NOT EXISTS convena.event_budget_categories (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_id UUID NOT NULL REFERENCES convena.events(id) ON DELETE CASCADE,
+            category VARCHAR(50) NOT NULL,
+            label VARCHAR(255) NOT NULL,
+            planned_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (event_id, category)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_budget_categories_event ON convena.event_budget_categories (event_id);
+
+        CREATE TABLE IF NOT EXISTS convena.event_expenses (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_id UUID NOT NULL REFERENCES convena.events(id) ON DELETE CASCADE,
+            title VARCHAR(255) NOT NULL,
+            category VARCHAR(50) NOT NULL,
+            amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+            receipt_url TEXT,
+            receipt_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            submitted_by_id UUID REFERENCES convena.users(id) ON DELETE SET NULL,
+            submitted_by VARCHAR(255) NOT NULL,
+            division VARCHAR(255) NOT NULL,
+            spj_status VARCHAR(50) NOT NULL DEFAULT 'submitted',
+            approved_by_id UUID REFERENCES convena.users(id) ON DELETE SET NULL,
+            approved_by VARCHAR(255),
+            notes TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_expenses_event ON convena.event_expenses (event_id);
+        CREATE INDEX IF NOT EXISTS idx_expenses_category ON convena.event_expenses (event_id, category);
+        CREATE INDEX IF NOT EXISTS idx_expenses_status ON convena.event_expenses (event_id, spj_status);
     "#;
 
-    sqlx::raw_sql(init_sql)
-        .execute(pool)
-        .await?;
+    sqlx::raw_sql(init_sql).execute(pool).await?;
+
+    if let Err(e) = seed_dev_data(pool).await {
+        tracing::warn!("Development data seeding skipped or encountered non-fatal issue: {e}");
+    }
 
     tracing::info!("Database schema and tables initialized successfully.");
+    Ok(())
+}
+
+/// Idempotently seed initial development data (users, events, memberships, event budgets & expenses).
+pub async fn seed_dev_data(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let default_pw_hash = hash_password("password123")
+        .unwrap_or_else(|_| "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$hash".to_string());
+
+    let user_arya = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let user_rina = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let user_dimas = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+
+    // 1. Seed Dev Users
+    let insert_user_sql = r#"
+        INSERT INTO convena.users (id, display_name, username, email, password_hash, role, company)
+        VALUES ($1, $2, $3, $4, $5, 'user', $6)
+        ON CONFLICT (username) DO NOTHING
+    "#;
+
+    let dev_users = [
+        (
+            user_arya,
+            "Arya Pratama",
+            "arya",
+            "arya@student.itb.ac.id",
+            "Institut Teknologi Bandung",
+        ),
+        (
+            user_rina,
+            "Rina Kartika",
+            "rina",
+            "rina@student.itb.ac.id",
+            "Institut Teknologi Bandung",
+        ),
+        (
+            user_dimas,
+            "Dimas Saputra",
+            "dimas",
+            "dimas@student.itb.ac.id",
+            "Institut Teknologi Bandung",
+        ),
+    ];
+
+    for (id, display_name, username, email, company) in dev_users {
+        let _ = query(insert_user_sql)
+            .bind(id)
+            .bind(display_name)
+            .bind(username)
+            .bind(email)
+            .bind(&default_pw_hash)
+            .bind(company)
+            .execute(pool)
+            .await;
+    }
+
+    // Fetch actual user IDs in case username/email already existed with another UUID
+    let arya_id: Uuid = query_scalar::<sqlx::Postgres, Uuid>(
+        "SELECT id FROM convena.users WHERE username = 'arya' OR email = 'arya@student.itb.ac.id' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(user_arya);
+
+    let rina_id: Uuid = query_scalar::<sqlx::Postgres, Uuid>(
+        "SELECT id FROM convena.users WHERE username = 'rina' OR email = 'rina@student.itb.ac.id' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(user_rina);
+
+    let dimas_id: Uuid = query_scalar::<sqlx::Postgres, Uuid>(
+        "SELECT id FROM convena.users WHERE username = 'dimas' OR email = 'dimas@student.itb.ac.id' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(user_dimas);
+
+    // 2. Seed Dev Events
+    let evt_arkavidia = Uuid::parse_str("11111111-1111-1111-1111-111111111101").unwrap();
+    let evt_summit = Uuid::parse_str("11111111-1111-1111-1111-111111111102").unwrap();
+    let evt_ui_forum = Uuid::parse_str("11111111-1111-1111-1111-111111111103").unwrap();
+
+    let arkavidia_tiers = serde_json::json!([
+        {
+            "id": "tkt-early",
+            "name": "Early Bird Student Pass",
+            "price": 35000.0,
+            "quota": 200,
+            "sold": 200,
+            "benefits": ["Access to all main stages", "E-Certificate with verification ID", "Merchandise sticker pack", "Lunch & Coffee break"],
+            "isAvailable": false
+        },
+        {
+            "id": "tkt-regular",
+            "name": "Regular Presale Pass",
+            "price": 50000.0,
+            "quota": 300,
+            "sold": 220,
+            "benefits": ["Access to all main stages & expo", "Official E-Certificate verified", "Free Workshop entrance voucher", "Networking lounge"],
+            "isAvailable": true
+        },
+        {
+            "id": "tkt-vip",
+            "name": "VIP Hackathon Team Pass (3 Pax)",
+            "price": 150000.0,
+            "quota": 50,
+            "sold": 38,
+            "benefits": ["24-Hour Hackathon seat", "Dedicated mentor pairing", "Exclusive dinner with Judges & Tech VCs", "Swag kit + T-shirt"],
+            "isAvailable": true
+        }
+    ]);
+
+    let summit_tiers = serde_json::json!([
+        {
+            "id": "tkt-vip-workshop",
+            "name": "VIP All-Access + Workshop",
+            "price": 350000.0,
+            "quota": 200,
+            "sold": 142,
+            "benefits": ["All-Stage VIP Access", "Hands-on AI Lab Workshop", "Exclusive Networking Dinner", "Verified Digital Certificate", "Official Summit Goodie Bag"],
+            "isAvailable": true
+        },
+        {
+            "id": "tkt-regular-summit",
+            "name": "General Delegate Pass",
+            "price": 150000.0,
+            "quota": 400,
+            "sold": 260,
+            "benefits": ["Main Hall Access", "Digital Summit Certificate", "Coffee Break & Lunch"],
+            "isAvailable": true
+        }
+    ]);
+
+    let ui_tiers = serde_json::json!([
+        {
+            "id": "tkt-online",
+            "name": "Virtual Attendee Pass",
+            "price": 0.0,
+            "quota": 500,
+            "sold": 390,
+            "benefits": ["High Definition Live Streaming", "Interactive Q&A Access", "Verified Digital E-Certificate"],
+            "isAvailable": true
+        },
+        {
+            "id": "tkt-onsite",
+            "name": "Balairung Onsite Delegate",
+            "price": 45000.0,
+            "quota": 500,
+            "sold": 390,
+            "benefits": ["Priority Balairung Seating", "Networking Session", "Snack & Lunch Box", "Printed Delegate Card"],
+            "isAvailable": true
+        }
+    ]);
+
+    let insert_event_sql = r#"
+        INSERT INTO convena.events (
+            id, created_by, title, slug, description, short_description, banner_url,
+            category, status, visibility, start_date, end_date, location_type,
+            venue_name, address, city, online_url, organization_name, company, ticket_tiers
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, 'published', 'public', $9::timestamptz, $10::timestamptz, $11,
+            $12, $13, $14, $15, $16, $17, $18
+        )
+        ON CONFLICT (slug) DO NOTHING
+    "#;
+
+    let _ = query(insert_event_sql)
+        .bind(evt_arkavidia)
+        .bind(arya_id)
+        .bind("Arkavidia 9.0: National Tech Festival & Hackathon")
+        .bind("arkavidia-9-national-tech-festival")
+        .bind("Festival teknologi tahunan terbesar mahasiswa ITB yang menghadirkan Hackathon 24-jam, UI/UX Competition, seminar teknologi masa depan, dan pameran karya inovasi mahasiswa se-Indonesia.")
+        .bind("National tech festival & hackathon organized by HMIF ITB with prizes up to Rp 50.000.000.")
+        .bind("https://images.unsplash.com/photo-1540575467063-178a50c2df87?w=800&auto=format&fit=crop&q=80")
+        .bind("festival")
+        .bind("2026-11-14T09:00:00+07:00")
+        .bind("2026-11-15T18:00:00+07:00")
+        .bind("offline")
+        .bind(Some("Aula Barat ITB"))
+        .bind(Some("Jl. Ganesha No. 10, Bandung"))
+        .bind(Some("Bandung"))
+        .bind(None::<String>)
+        .bind(Some("HMIF ITB"))
+        .bind(Some("Institut Teknologi Bandung"))
+        .bind(sqlx::types::Json(arkavidia_tiers))
+        .execute(pool)
+        .await;
+
+    let _ = query(insert_event_sql)
+        .bind(evt_summit)
+        .bind(arya_id)
+        .bind("Global Tech Innovators Summit 2026 Tel-U")
+        .bind("global-tech-innovators-summit-2026-tel-u")
+        .bind("Konferensi internasional inovasi teknologi terdepan bersama para pakar Silicon Valley, pemimpin startup Asia, dan akademisi riset. Menghadirkan sesi keynote, workshop kecerdasan buatan, dan pameran prototipe masa depan.")
+        .bind("Premier international tech summit featuring world-class keynotes, deep-dive workshops, and breakthrough innovations.")
+        .bind("https://images.unsplash.com/photo-1505373877841-8d25f7d46678?w=800&auto=format&fit=crop&q=80")
+        .bind("conference")
+        .bind("2026-11-28T08:30:00+07:00")
+        .bind("2026-11-29T17:00:00+07:00")
+        .bind("offline")
+        .bind(Some("Telkom University Convention Hall"))
+        .bind(Some("Jl. Telekomunikasi No. 1, Buahbatu, Bandung"))
+        .bind(Some("Bandung"))
+        .bind(None::<String>)
+        .bind(Some("BEM Kema Telkom University"))
+        .bind(Some("Telkom University"))
+        .bind(sqlx::types::Json(summit_tiers))
+        .execute(pool)
+        .await;
+
+    let _ = query(insert_event_sql)
+        .bind(evt_ui_forum)
+        .bind(arya_id)
+        .bind("UI Youth Leadership & Policy Forum 2026")
+        .bind("ui-youth-leadership-summit")
+        .bind("Forum dialog kepemimpinan mahasiswa nasional bersama menteri, praktisi startup, dan penggerak sosial untuk merancang peta jalan Indonesia Berkelanjutan.")
+        .bind("National leadership forum by BEM UI featuring youth leaders & changemakers across Indonesia.")
+        .bind("https://images.unsplash.com/photo-1511578314322-379afb476865?w=800&auto=format&fit=crop&q=80")
+        .bind("seminar")
+        .bind("2026-11-20T08:30:00+07:00")
+        .bind("2026-11-20T17:00:00+07:00")
+        .bind("hybrid")
+        .bind(Some("Balairung Universitas Indonesia"))
+        .bind(Some("Kampus UI Depok, Jawa Barat"))
+        .bind(Some("Depok"))
+        .bind(Some("https://live.convena.id/ui-summit"))
+        .bind(Some("BEM UI"))
+        .bind(Some("Universitas Indonesia"))
+        .bind(sqlx::types::Json(ui_tiers))
+        .execute(pool)
+        .await;
+
+    // 3. Seed Event Memberships for the dev events
+    let insert_member_sql = r#"
+        INSERT INTO convena.event_members (event_id, user_id, role, custom_title, status)
+        VALUES ($1, $2, $3, $4, 'active')
+        ON CONFLICT (event_id, user_id) DO NOTHING
+    "#;
+
+    for (evt_id, uid, role, title) in [
+        (evt_arkavidia, arya_id, "owner", "Ketua Pelaksana"),
+        (evt_arkavidia, rina_id, "treasurer", "Bendahara Umum"),
+        (evt_arkavidia, dimas_id, "committee", "Koordinator Logistik"),
+        (evt_summit, arya_id, "owner", "Project Director"),
+        (evt_summit, rina_id, "treasurer", "Head of Finance"),
+        (evt_ui_forum, arya_id, "owner", "Ketua Forum"),
+        (evt_ui_forum, rina_id, "treasurer", "Bendahara Forum"),
+    ] {
+        let _ = query(insert_member_sql)
+            .bind(evt_id)
+            .bind(uid)
+            .bind(role)
+            .bind(title)
+            .execute(pool)
+            .await;
+    }
+
+    // 4. Seed Event-Specific Budget Categories for Dev Events
+    let insert_cat_sql = r#"
+        INSERT INTO convena.event_budget_categories (event_id, category, label, planned_amount)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (event_id, category) DO NOTHING
+    "#;
+
+    let arkavidia_plans = [
+        ("venue", "Sewa Gedung & Aula", 25_000_000.0),
+        ("catering", "Konsumsi Peserta & Panitia", 18_000_000.0),
+        ("equipment", "Sound, Lighting & Stage", 15_000_000.0),
+        ("marketing", "Publikasi & Cetak Spanduk", 7_000_000.0),
+        ("speaker_honor", "Honorarium Pembicara & Juri", 12_000_000.0),
+        ("logistics", "Merchandise & Swag Kit", 8_000_000.0),
+        ("other", "Biaya Lain-lain & Tak Terduga", 5_000_000.0),
+    ];
+    for (cat, label, planned) in arkavidia_plans {
+        let _ = query(insert_cat_sql)
+            .bind(evt_arkavidia)
+            .bind(cat)
+            .bind(label)
+            .bind(planned)
+            .execute(pool)
+            .await;
+    }
+
+    let summit_plans = [
+        ("venue", "Sewa Gedung & Aula", 35_000_000.0),
+        ("catering", "Konsumsi Peserta & Panitia", 22_000_000.0),
+        ("equipment", "Sound, Lighting & Stage", 20_000_000.0),
+        ("marketing", "Publikasi & Cetak Spanduk", 10_000_000.0),
+        ("speaker_honor", "Honorarium Pembicara & Juri", 25_000_000.0),
+        ("logistics", "Merchandise & Swag Kit", 12_000_000.0),
+        ("other", "Biaya Lain-lain & Tak Terduga", 6_000_000.0),
+    ];
+    for (cat, label, planned) in summit_plans {
+        let _ = query(insert_cat_sql)
+            .bind(evt_summit)
+            .bind(cat)
+            .bind(label)
+            .bind(planned)
+            .execute(pool)
+            .await;
+    }
+
+    let ui_plans = [
+        ("venue", "Sewa Gedung & Aula", 15_000_000.0),
+        ("catering", "Konsumsi Peserta & Panitia", 12_000_000.0),
+        ("equipment", "Sound, Lighting & Stage", 8_000_000.0),
+        ("marketing", "Publikasi & Cetak Spanduk", 5_000_000.0),
+        ("speaker_honor", "Honorarium Pembicara & Juri", 10_000_000.0),
+        ("logistics", "Merchandise & Swag Kit", 6_000_000.0),
+        ("other", "Biaya Lain-lain & Tak Terduga", 4_000_000.0),
+    ];
+    for (cat, label, planned) in ui_plans {
+        let _ = query(insert_cat_sql)
+            .bind(evt_ui_forum)
+            .bind(cat)
+            .bind(label)
+            .bind(planned)
+            .execute(pool)
+            .await;
+    }
+
+    // Ensure all other existing events also have default RAB categories
+    let all_event_ids: Vec<Uuid> =
+        query_scalar::<sqlx::Postgres, Uuid>("SELECT id FROM convena.events")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+    for event_id in all_event_ids {
+        for (cat, label) in DEFAULT_BUDGET_CATEGORIES {
+            let _ = query(insert_cat_sql)
+                .bind(event_id)
+                .bind(*cat)
+                .bind(*label)
+                .bind(0.0_f64)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    // 5. Seed Initial Event-Specific Expenses (using deterministic UUIDs so ON CONFLICT DO NOTHING works)
+    let insert_exp_sql = r#"
+        INSERT INTO convena.event_expenses (
+            id, event_id, title, category, amount, receipt_date,
+            submitted_by_id, submitted_by, division, spj_status,
+            approved_by_id, approved_by, notes
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6::timestamptz,
+            $7, $8, $9, $10,
+            $11, $12, $13
+        )
+        ON CONFLICT (id) DO NOTHING
+    "#;
+
+    let seeded_expenses = [
+        (
+            Uuid::parse_str("22222222-2222-2222-2222-222222222101").unwrap(),
+            evt_arkavidia,
+            "Down Payment Sewa Aula Barat ITB (50%)",
+            "venue",
+            12_500_000.0,
+            "2026-10-10T09:00:00Z",
+            Some(dimas_id),
+            "Dimas Saputra (Logistik)",
+            "Divisi Logistik",
+            "verified",
+            Some(rina_id),
+            Some("Rina Kartika (Bendahara)"),
+            Some("Kuitansi resmi SARPRAS ITB terlampir dengan materai Rp 10.000."),
+        ),
+        (
+            Uuid::parse_str("22222222-2222-2222-2222-222222222102").unwrap(),
+            evt_arkavidia,
+            "Pelunasan Sewa Aula Barat ITB",
+            "venue",
+            12_500_000.0,
+            "2026-10-15T14:30:00Z",
+            Some(dimas_id),
+            "Dimas Saputra (Logistik)",
+            "Divisi Logistik",
+            "verified",
+            Some(rina_id),
+            Some("Rina Kartika (Bendahara)"),
+            Some("Pelunasan lunas, bukti potong pajak PPh 23 lengkap."),
+        ),
+        (
+            Uuid::parse_str("22222222-2222-2222-2222-222222222103").unwrap(),
+            evt_arkavidia,
+            "Cetak 500 ID Card & Lanyard Peserta",
+            "marketing",
+            3_200_000.0,
+            "2026-10-21T11:00:00Z",
+            Some(arya_id),
+            "Arya Pratama (Panitia)",
+            "Divisi Acara & Kreatif",
+            "submitted",
+            None,
+            None,
+            Some("Invoice dari Percetakan Surya Grafika Bandung, menunggu verifikasi SPJ."),
+        ),
+        (
+            Uuid::parse_str("22222222-2222-2222-2222-222222222104").unwrap(),
+            evt_arkavidia,
+            "Konsumsi Technical Meeting & Gladi Kotor",
+            "catering",
+            4_500_000.0,
+            "2026-10-23T16:00:00Z",
+            Some(dimas_id),
+            "Dimas Saputra (Logistik)",
+            "Divisi Konsumsi",
+            "verified",
+            Some(rina_id),
+            Some("Rina Kartika (Bendahara)"),
+            Some("Nota katering 150 box makan siang panitia dan pemateri."),
+        ),
+        (
+            Uuid::parse_str("22222222-2222-2222-2222-222222222201").unwrap(),
+            evt_summit,
+            "Booking Telkom University Convention Hall",
+            "venue",
+            20_000_000.0,
+            "2026-10-12T10:00:00Z",
+            Some(arya_id),
+            "Arya Pratama (Project Director)",
+            "Divisi Venue & Operasional",
+            "verified",
+            Some(rina_id),
+            Some("Rina Kartika (Finance)"),
+            Some("Bukti transfer DP gedung TUCH terverifikasi."),
+        ),
+        (
+            Uuid::parse_str("22222222-2222-2222-2222-222222222202").unwrap(),
+            evt_summit,
+            "Tiket & Akomodasi Keynote Speaker Internasional",
+            "speaker_honor",
+            9_500_000.0,
+            "2026-10-25T13:15:00Z",
+            Some(arya_id),
+            "Arya Pratama (Project Director)",
+            "Divisi Acara & Speaker Liaison",
+            "submitted",
+            None,
+            None,
+            Some("Invoice maskapai dan reservasi hotel 2 malam di Bandung."),
+        ),
+        (
+            Uuid::parse_str("22222222-2222-2222-2222-222222222301").unwrap(),
+            evt_ui_forum,
+            "Sewa Peralatan Live Streaming Multi-Cam Balairung",
+            "equipment",
+            5_500_000.0,
+            "2026-10-18T15:00:00Z",
+            Some(arya_id),
+            "Arya Pratama",
+            "Divisi Produksi & Multimedia",
+            "verified",
+            Some(rina_id),
+            Some("Rina Kartika"),
+            Some("Kuitansi vendor broadcast 4 kamera HDMI + switcher."),
+        ),
+    ];
+
+    for (
+        id,
+        event_id,
+        title,
+        category,
+        amount,
+        receipt_date,
+        submitted_by_id,
+        submitted_by,
+        division,
+        spj_status,
+        approved_by_id,
+        approved_by,
+        notes,
+    ) in seeded_expenses
+    {
+        let _ = query(insert_exp_sql)
+            .bind(id)
+            .bind(event_id)
+            .bind(title)
+            .bind(category)
+            .bind(amount)
+            .bind(receipt_date)
+            .bind(submitted_by_id)
+            .bind(submitted_by)
+            .bind(division)
+            .bind(spj_status)
+            .bind(approved_by_id)
+            .bind(approved_by)
+            .bind(notes)
+            .execute(pool)
+            .await;
+    }
+
     Ok(())
 }

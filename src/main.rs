@@ -2,7 +2,6 @@ pub mod config;
 pub mod appstate;
 pub mod db;
 pub mod models;
-pub mod routes;
 pub mod services;
 
 use std::net::SocketAddr;
@@ -58,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO))
         .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
 
-    let app = routes::build_router(app_state)
+    let app = services::build_router(app_state)
         .layer(trace_layer)
         .layer(cors)
         .layer(Extension(pool));

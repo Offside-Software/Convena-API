@@ -13,6 +13,7 @@ use crate::{
     db,
     models::{
         event::{CreateEventPayload, Event, EventWithRole},
+        finance::DEFAULT_BUDGET_CATEGORIES,
         membership::{
             EventMemberDetail, EventPermission, EventRole, InviteMemberPayload,
             UpdateMemberRolePayload,
@@ -29,7 +30,10 @@ pub fn event_routes() -> Router<AppState> {
         .route("/", post(create_event_handler).get(list_events_handler))
         .route("/my-events", get(list_my_events_handler))
         .route("/{id}", get(get_event_handler))
-        .route("/{id}/members", get(list_members_handler).post(invite_member_handler))
+        .route(
+            "/{id}/members",
+            get(list_members_handler).post(invite_member_handler),
+        )
         .route(
             "/{id}/members/{user_id}",
             patch(update_member_handler).delete(remove_member_handler),
@@ -47,7 +51,7 @@ fn generate_slug(title: &str) -> String {
     format!("{trimmed}-{suffix}")
 }
 
-fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok()
@@ -63,7 +67,7 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         })
 }
 
-/// Create a new event and automatically make the creator the 'owner'.
+/// Create a new event, automatically make the creator the 'owner', and initialize RAB categories.
 pub async fn create_event_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -74,7 +78,9 @@ pub async fn create_event_handler(
         Err(_) => {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(json!({ "message": "Otorisasi diperlukan untuk membuat event", "code": "UNAUTHORIZED" })),
+                Json(
+                    json!({ "message": "Otorisasi diperlukan untuk membuat event", "code": "UNAUTHORIZED" }),
+                ),
             );
         }
     };
@@ -92,7 +98,9 @@ pub async fn create_event_handler(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "message": "Format tanggal mulai tidak valid", "code": "INVALID_START_DATE" })),
+                Json(
+                    json!({ "message": "Format tanggal mulai tidak valid", "code": "INVALID_START_DATE" }),
+                ),
             );
         }
     };
@@ -102,7 +110,9 @@ pub async fn create_event_handler(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "message": "Format tanggal selesai tidak valid", "code": "INVALID_END_DATE" })),
+                Json(
+                    json!({ "message": "Format tanggal selesai tidak valid", "code": "INVALID_END_DATE" }),
+                ),
             );
         }
     };
@@ -116,7 +126,9 @@ pub async fn create_event_handler(
     let now = chrono::Utc::now();
     let status = payload.status.unwrap_or_else(|| "draft".to_string());
     let visibility = payload.visibility.unwrap_or_else(|| "public".to_string());
-    let location_type = payload.location_type.unwrap_or_else(|| "offline".to_string());
+    let location_type = payload
+        .location_type
+        .unwrap_or_else(|| "offline".to_string());
     let ticket_tiers = sqlx::types::Json(payload.ticket_tiers.unwrap_or_default());
 
     let mut tx = match state.pool.begin().await {
@@ -178,7 +190,9 @@ pub async fn create_event_handler(
             let _ = tx.rollback().await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "message": "Gagal menyimpan event ke basis data", "code": "DB_ERROR" })),
+                Json(
+                    json!({ "message": "Gagal menyimpan event ke basis data", "code": "DB_ERROR" }),
+                ),
             );
         }
     };
@@ -205,8 +219,32 @@ pub async fn create_event_handler(
         let _ = tx.rollback().await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "message": "Gagal mengalokasikan role pemilik event", "code": "DB_ERROR" })),
+            Json(
+                json!({ "message": "Gagal mengalokasikan role pemilik event", "code": "DB_ERROR" }),
+            ),
         );
+    }
+
+    // 3. Initialize default RAB budget categories for this event
+    let insert_cat_sql = r#"
+        INSERT INTO convena.event_budget_categories (
+            id, event_id, category, label, planned_amount, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, 0, $5, $5)
+        ON CONFLICT (event_id, category) DO NOTHING
+    "#;
+
+    for (cat, label) in DEFAULT_BUDGET_CATEGORIES {
+        if let Err(e) = db::query(insert_cat_sql)
+            .bind(Uuid::new_v4())
+            .bind(event_id)
+            .bind(*cat)
+            .bind(*label)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::warn!("Failed to initialize budget category {cat} for event {event_id}: {e}");
+        }
     }
 
     if let Err(e) = tx.commit().await {
@@ -522,7 +560,9 @@ pub async fn invite_member_handler(
                 tracing::error!("Failed to add member directly: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "message": "Gagal menambahkan anggota ke event", "code": "DB_ERROR" })),
+                    Json(
+                        json!({ "message": "Gagal menambahkan anggota ke event", "code": "DB_ERROR" }),
+                    ),
                 );
             }
 
@@ -563,7 +603,9 @@ pub async fn invite_member_handler(
                 tracing::error!("Failed to create invitation: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "message": "Gagal membuat tautan undangan", "code": "DB_ERROR" })),
+                    Json(
+                        json!({ "message": "Gagal membuat tautan undangan", "code": "DB_ERROR" }),
+                    ),
                 );
             }
 
@@ -625,30 +667,37 @@ pub async fn update_member_handler(
     if !can_manage {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "message": "Anda tidak memiliki izin mengubah role anggota", "code": "FORBIDDEN" })),
+            Json(
+                json!({ "message": "Anda tidak memiliki izin mengubah role anggota", "code": "FORBIDDEN" }),
+            ),
         );
     }
 
-    let current_target_role = match get_user_event_role(&state.pool, target_user_id, event_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "message": "Anggota tidak ditemukan di event ini", "code": "MEMBER_NOT_FOUND" })),
-            );
-        }
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "message": "Kesalahan basis data", "code": "DB_ERROR" })),
-            );
-        }
-    };
+    let current_target_role =
+        match get_user_event_role(&state.pool, target_user_id, event_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        json!({ "message": "Anggota tidak ditemukan di event ini", "code": "MEMBER_NOT_FOUND" }),
+                    ),
+                );
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "message": "Kesalahan basis data", "code": "DB_ERROR" })),
+                );
+            }
+        };
 
     if current_target_role == EventRole::Owner {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "message": "Tidak dapat mengubah role Owner event", "code": "CANNOT_MODIFY_OWNER" })),
+            Json(
+                json!({ "message": "Tidak dapat mengubah role Owner event", "code": "CANNOT_MODIFY_OWNER" }),
+            ),
         );
     }
 
@@ -728,7 +777,9 @@ pub async fn remove_member_handler(
     if !can_manage {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "message": "Anda tidak memiliki izin menghapus anggota", "code": "FORBIDDEN" })),
+            Json(
+                json!({ "message": "Anda tidak memiliki izin menghapus anggota", "code": "FORBIDDEN" }),
+            ),
         );
     }
 
@@ -737,7 +788,9 @@ pub async fn remove_member_handler(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "message": "Anggota tidak ditemukan di event ini", "code": "MEMBER_NOT_FOUND" })),
+                Json(
+                    json!({ "message": "Anggota tidak ditemukan di event ini", "code": "MEMBER_NOT_FOUND" }),
+                ),
             );
         }
         Err(_) => {
@@ -751,7 +804,9 @@ pub async fn remove_member_handler(
     if target_role == EventRole::Owner {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "message": "Tidak dapat menghapus Owner event", "code": "CANNOT_REMOVE_OWNER" })),
+            Json(
+                json!({ "message": "Tidak dapat menghapus Owner event", "code": "CANNOT_REMOVE_OWNER" }),
+            ),
         );
     }
 
@@ -765,7 +820,9 @@ pub async fn remove_member_handler(
         tracing::error!("Failed to delete member: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "message": "Gagal menghapus anggota dari event", "code": "DB_ERROR" })),
+            Json(
+                json!({ "message": "Gagal menghapus anggota dari event", "code": "DB_ERROR" }),
+            ),
         );
     }
 
