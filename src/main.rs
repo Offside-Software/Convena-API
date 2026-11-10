@@ -25,15 +25,28 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load();
     tracing::info!("Configuration loaded. Database target configured");
 
+    // Check for optional manual CLI flag to initialize/seed database:
+    // e.g. `cargo run -- --init-db` or `cargo run --bin seed`
+    let args: Vec<String> = std::env::args().collect();
+    let should_init_db = args.iter().any(|arg| arg == "--init-db" || arg == "-i");
+
     // 3. Initialize Database Connection Pool
     let pool = match db::create_pool(&config.database_url).await {
         Ok(p) => {
             tracing::info!("Connected to PostgreSQL database pool successfully.");
+            if should_init_db {
+                tracing::info!("--init-db flag detected. Running database initialization & seed...");
+                if let Err(e) = db::init_database(&p).await {
+                    tracing::error!("Failed to initialize database: {e}");
+                } else {
+                    tracing::info!("Database initialized & seeded successfully.");
+                }
+            }
             p
         }
         Err(e) => {
             tracing::warn!("Could not connect to PostgreSQL on startup: {e}");
-            tracing::info!("Falling abck to offline/lazy pool initialization. Please check POSTGRESQL_DATABASE_URL.");
+            tracing::info!("Falling back to offline/lazy pool initialization. Please check POSTGRESQL_DATABASE_URL.");
             let options = db::get_connect_options(&config.database_url)?;
             db::get_pool_options().connect_lazy_with(options)
         }

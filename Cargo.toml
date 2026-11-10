@@ -2,6 +2,7 @@
 name = "convena-api"
 version = "0.1.0"
 edition = "2024"
+default-run = "convena-api"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "ws"] }

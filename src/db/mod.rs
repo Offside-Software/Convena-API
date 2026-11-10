@@ -59,8 +59,6 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let options = get_connect_options(database_url)?;
 
     let pool = get_pool_options().connect_with(options).await?;
-
-    init_database(&pool).await?;
     Ok(pool)
 }
 
